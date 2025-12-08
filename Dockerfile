@@ -1,10 +1,19 @@
 # Kokoro TTS RunPod Serverless Worker with R2 Upload
-# Using RunPod's base image for faster builds
-FROM runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04
+# CPU-only build to avoid disk space issues
+FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install dependencies
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    libsndfile1 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies (CPU-only torch)
+RUN pip install --no-cache-dir \
+    torch --index-url https://download.pytorch.org/whl/cpu
+
 RUN pip install --no-cache-dir \
     runpod \
     boto3 \
