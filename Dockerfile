@@ -1,19 +1,23 @@
 # Kokoro TTS RunPod Serverless Worker with R2 Upload
-# CPU-only build to avoid disk space issues
-FROM python:3.10-slim
+# GPU-enabled using NVIDIA CUDA slim base
+FROM nvidia/cuda:11.8.0-runtime-ubuntu22.04
 
 WORKDIR /app
 
-# Install system dependencies
+# Install Python and system dependencies
 RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3-pip \
     libsndfile1 \
     ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/python3.10 /usr/bin/python
 
-# Install Python dependencies (CPU-only torch)
+# Install PyTorch with CUDA support (cu118 for CUDA 11.8)
 RUN pip install --no-cache-dir \
-    torch --index-url https://download.pytorch.org/whl/cpu
+    torch --index-url https://download.pytorch.org/whl/cu118
 
+# Install other dependencies
 RUN pip install --no-cache-dir \
     runpod \
     boto3 \
