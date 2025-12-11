@@ -1,13 +1,19 @@
 """
-Kokoro TTS RunPod Serverless Handler with R2 Upload
+Kokoro TTS RunPod Serverless Handler with R2 Upload and Pause Support
 Generates audio and uploads directly to Cloudflare R2, returns URL
+
+Supports pause markers:
+  - [0.5s], [1s], [2s], [3s] - bracket syntax
+  - PAUSE_0.5, PAUSE_1, PAUSE_2, PAUSE_3 - underscore syntax
 """
 
 import runpod
 import torch
 import soundfile as sf
+import numpy as np
 import io
 import os
+import re
 import boto3
 from botocore.config import Config
 import uuid
@@ -16,6 +22,10 @@ import time
 # Initialize Kokoro TTS model (loaded once, reused for all requests)
 kokoro_model = None
 kokoro_voicepacks = {}
+
+# Kokoro sample rate
+SAMPLE_RATE = 24000
+
 
 def load_kokoro():
     """Load Kokoro TTS model and voicepacks"""
@@ -73,10 +83,62 @@ def upload_to_r2(audio_data, filename):
         raise Exception(f"R2 upload failed: {str(e)}")
 
 
-def generate_tts(text, voice='af_heart', speed=1.0):
-    """Generate TTS audio using Kokoro"""
-    model, voicepacks = load_kokoro()
+def generate_silence(seconds):
+    """Generate silence array for given duration"""
+    num_samples = int(SAMPLE_RATE * seconds)
+    return np.zeros(num_samples, dtype=np.float32)
 
+
+def parse_pause_markers(text):
+    """
+    Parse text and split into segments with pause durations.
+
+    Supports:
+      - [0.5s], [1s], [2s], [3s] - bracket syntax
+      - PAUSE_0.5, PAUSE_1, PAUSE_2, PAUSE_3 - underscore syntax
+
+    Returns list of tuples: [('text', 'segment text'), ('pause', 1.5), ...]
+    """
+    # Combined pattern for both syntaxes
+    # [Xs] or [X.Xs] - bracket syntax
+    # PAUSE_X or PAUSE_X.X - underscore syntax
+    pattern = r'\[(\d+(?:\.\d+)?)\s*s\]|PAUSE_(\d+(?:\.\d+)?)'
+
+    segments = []
+    last_end = 0
+
+    for match in re.finditer(pattern, text, re.IGNORECASE):
+        # Add text before this pause marker
+        text_before = text[last_end:match.start()].strip()
+        if text_before:
+            segments.append(('text', text_before))
+
+        # Get pause duration from whichever group matched
+        pause_duration = match.group(1) or match.group(2)
+        pause_seconds = float(pause_duration)
+
+        # Cap pause at 10 seconds max for safety
+        pause_seconds = min(pause_seconds, 10.0)
+
+        if pause_seconds > 0:
+            segments.append(('pause', pause_seconds))
+
+        last_end = match.end()
+
+    # Add remaining text after last pause marker
+    remaining_text = text[last_end:].strip()
+    if remaining_text:
+        segments.append(('text', remaining_text))
+
+    # If no pause markers found, return whole text as single segment
+    if not segments:
+        segments.append(('text', text))
+
+    return segments
+
+
+def generate_tts_segment(text, voice, speed, model, voicepacks):
+    """Generate TTS audio for a single text segment"""
     # Get voicepack (load if not cached)
     if voice not in voicepacks:
         try:
@@ -97,11 +159,49 @@ def generate_tts(text, voice='af_heart', speed=1.0):
     for _, _, audio_chunk in generator:
         audio_chunks.append(audio_chunk)
 
-    # Concatenate all chunks
-    import numpy as np
-    full_audio = np.concatenate(audio_chunks)
+    if audio_chunks:
+        return np.concatenate(audio_chunks)
+    return np.array([], dtype=np.float32)
 
-    return full_audio, 24000  # Kokoro outputs at 24kHz
+
+def generate_tts(text, voice='af_heart', speed=1.0):
+    """
+    Generate TTS audio using Kokoro with pause support.
+
+    Parses pause markers like [1s], [2s], PAUSE_1, PAUSE_2 and inserts
+    actual silence between audio segments.
+    """
+    model, voicepacks = load_kokoro()
+
+    # Parse text for pause markers
+    segments = parse_pause_markers(text)
+
+    print(f"📝 Parsed {len(segments)} segments from text")
+
+    # Generate audio for each segment
+    audio_parts = []
+
+    for seg_type, seg_value in segments:
+        if seg_type == 'pause':
+            # Insert silence
+            silence = generate_silence(seg_value)
+            audio_parts.append(silence)
+            print(f"⏸️  Added {seg_value}s silence ({len(silence)} samples)")
+        else:
+            # Generate TTS for text
+            if seg_value.strip():
+                audio = generate_tts_segment(seg_value, voice, speed, model, voicepacks)
+                if len(audio) > 0:
+                    audio_parts.append(audio)
+                    print(f"🎙️  Generated {len(audio)/SAMPLE_RATE:.2f}s audio for: {seg_value[:50]}...")
+
+    # Concatenate all parts
+    if audio_parts:
+        full_audio = np.concatenate(audio_parts)
+    else:
+        full_audio = np.array([], dtype=np.float32)
+
+    return full_audio, SAMPLE_RATE
 
 
 def handler(job):
@@ -122,9 +222,12 @@ def handler(job):
     try:
         start_time = time.time()
 
-        # Generate audio
+        # Generate audio (with pause support)
         audio_data, sample_rate = generate_tts(text, voice, speed)
         generation_time = time.time() - start_time
+
+        if len(audio_data) == 0:
+            return {"error": "No audio generated"}
 
         # Convert to WAV bytes
         buffer = io.BytesIO()
@@ -158,7 +261,8 @@ def handler(job):
         }
 
     except Exception as e:
-        return {"error": str(e)}
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
 
 
 # Start the serverless handler
